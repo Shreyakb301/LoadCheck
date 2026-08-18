@@ -566,7 +566,7 @@ export async function analyzeURL(url: string): Promise<APIResponse> {
     resourceItems.sort((a, b) => b.size - a.size);
 
     // Build problems using diagnosis engine
-    const { worthFixing, notWorthFixing, allAuditKeys } = buildProblems(parsedAudits, framework, 'simple');
+    const { worthFixing, notWorthFixing, allAuditKeys } = buildProblems(parsedAudits, framework, 'simple', performanceScore);
 
     const auditPositives = getAuditPositives(parsedAudits, new Set(allAuditKeys));
     const positives = [...metricPositives, ...auditPositives].slice(0, 6);
@@ -579,6 +579,12 @@ export async function analyzeURL(url: string): Promise<APIResponse> {
     if (worthFixing.length === 0) {
       headline = 'Nothing major is slowing this page down.';
       headlineDetail = null;
+    } else if (performanceScore >= 90) {
+      // A good score deserves a good-news framing, even if a small thing is worth polishing.
+      headline = worthFixing.length === 1
+        ? 'Your site is in great shape. One thing could make it even better.'
+        : `Your site is in great shape. ${worthFixing.length} things could make it even better.`;
+      headlineDetail = `Consider: ${worthFixing[0].title.charAt(0).toLowerCase()}${worthFixing[0].title.slice(1)}.`;
     } else {
       headline = `${worthFixing.length} thing${worthFixing.length === 1 ? '' : 's'} worth fixing.`;
       headlineDetail = `${worthFixing[0].title}. Start there.`;
@@ -641,8 +647,8 @@ const EFFORT_BY_KEY: Record<string, 'easy' | 'medium' | 'hard'> = {
   'largest-contentful-paint': 'medium',
   'server-response-time': 'hard',
   'total-byte-weight': 'hard',
-  'main-thread-work': 'hard',
-  'javascript-execution': 'hard',
+  'mainthread-work-breakdown': 'hard',
+  'bootup-time': 'hard',
   'total-blocking-time': 'hard',
 };
 
@@ -672,7 +678,7 @@ function getIgnoreReason(problem: { verdict: string; savingsLabel?: string }): s
     : 'This has minimal effect on your visitors right now.';
 }
 
-function buildProblems(audits: Array<{ key: string; title: string; description: string; score: number | null; scoreDisplayMode: string; wastedBytes: number; wastedMs: number; numericValue: number | null; numericUnit: string | null; displayValue: string | null; items: Array<{ url?: string; name?: string; size?: number; wastedBytes?: number; wastedMS?: number; }>; }>, framework: string | null, verbosity: 'simple' | 'developer') {
+function buildProblems(audits: Array<{ key: string; title: string; description: string; score: number | null; scoreDisplayMode: string; wastedBytes: number; wastedMs: number; numericValue: number | null; numericUnit: string | null; displayValue: string | null; items: Array<{ url?: string; name?: string; size?: number; wastedBytes?: number; wastedMS?: number; }>; }>, framework: string | null, verbosity: 'simple' | 'developer', performanceScore: number) {
   const problems: Array<{
     title: string;
     resource?: string;
@@ -684,6 +690,7 @@ function buildProblems(audits: Array<{ key: string; title: string; description: 
     description: string;
     soWhat: string;
     whatToDo: string[];
+    devWhatToDo: string[];
     savingsBytes?: number;
     savingsLabel?: string;
     details: string;
@@ -702,7 +709,7 @@ function buildProblems(audits: Array<{ key: string; title: string; description: 
   };
 
   for (const audit of audits) {
-    const result = createProblemByKey(audit, framework, verbosity);
+    const result = createProblemByKey(audit, framework, verbosity, performanceScore);
     addProblem(result);
   }
 
@@ -787,8 +794,29 @@ function impactScore(problem: any): number {
   return score;
 }
 
-function createProblemByKey(audit: { key: string; title: string; description: string; score: number | null; scoreDisplayMode: string; wastedBytes: number; wastedMs: number; numericValue: number | null; numericUnit: string | null; displayValue: string | null; items: Array<{ url?: string; name?: string; size?: number; wastedBytes?: number; wastedMS?: number; }>; }, framework: string | null, verbosity: 'simple' | 'developer') {
+function biggestWaster(items: Array<{ url?: string; name?: string; size?: number; wastedBytes?: number }>): { url?: string; name?: string; size?: number; wastedBytes?: number } | null {
+  const candidates = items.filter(i => (i.wastedBytes || 0) > 0 || (i.size || 0) > 0);
+  if (candidates.length === 0) return null;
+  return candidates.reduce((a, b) => {
+    const aWeight = a.wastedBytes || a.size || 0;
+    const bWeight = b.wastedBytes || b.size || 0;
+    return bWeight > aWeight ? b : a;
+  });
+}
+
+function fileNameOf(url?: string): string | null {
+  if (!url) return null;
+  try {
+    const parts = new URL(url).pathname.split('/').filter(Boolean);
+    return parts[parts.length - 1] || url;
+  } catch {
+    return url.split('/').filter(Boolean).pop() || url;
+  }
+}
+
+function createProblemByKey(audit: { key: string; title: string; description: string; score: number | null; scoreDisplayMode: string; wastedBytes: number; wastedMs: number; numericValue: number | null; numericUnit: string | null; displayValue: string | null; items: Array<{ url?: string; name?: string; size?: number; wastedBytes?: number; wastedMS?: number; }>; }, framework: string | null, verbosity: 'simple' | 'developer', performanceScore: number) {
   const { key, title, wastedBytes, wastedMs, numericValue, items } = audit;
+  const scoresWell = performanceScore >= 90;
 
   if (wastedBytes <= 0 && wastedMs <= 0 && !numericValue) return null;
 
@@ -814,6 +842,13 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         verbosity === 'simple' ? 'Lazy-load it if it is below the fold' : 'Lazy-load below-the-fold images',
         framework === 'Next.js' ? 'Serve it through Next.js <Image> with appropriate dimensions' : '',
       ].filter(Boolean),
+      devWhatToDo: [
+        'Serve via <picture> with AVIF/WebP sources and a JPEG/PNG fallback',
+        'Resize server-side to the largest rendered dimension, check your srcset/sizes',
+        `Run it through sharp or squoosh-cli at quality 75-80${biggest?.url ? ` (${biggest.url.split('/').pop()})` : ''}`,
+        'Add loading="lazy" and decoding="async" below the fold',
+        framework === 'Next.js' ? 'Use next/image, priority only on the LCP image, default lazy elsewhere' : 'Use an image CDN (Cloudinary, Imgix) for automatic format negotiation',
+      ].filter(Boolean),
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}.`,
@@ -825,44 +860,70 @@ function createProblemByKey(audit: { key: string; title: string; description: st
 
   if (key === 'unused-css-rules') {
     const savings = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = fileNameOf(biggest?.url);
     return {
       title: "Your CSS has rules that aren't used on this page",
+      resource: biggest?.url,
       impact: savings > 100_000 ? 'high' : savings > 30_000 ? 'medium' : 'low',
-      description: `About ${bytesToLabel(savings)} of CSS could potentially be avoided during the initial page load.`,
+      description: biggestName
+        ? `${biggestName} alone carries about ${bytesToLabel(biggest?.wastedBytes || savings)} of unused CSS, out of ${bytesToLabel(savings)} total.`
+        : `About ${bytesToLabel(savings)} of CSS could potentially be avoided during the initial page load.`,
       soWhat: 'Extra CSS forces the browser to do unnecessary work parsing and applying styles.',
       whatToDo: [
-        'Remove unused CSS rules',
+        biggestName ? `Start with ${biggestName}, the largest offender` : 'Remove unused CSS rules',
         'Split CSS into page-specific bundles',
         'Use tools like PurgeCSS or Tailwind\'s tree-shaking',
+      ],
+      devWhatToDo: [
+        'Open DevTools > Coverage (Cmd+Shift+P > "Show Coverage") to see exactly which rules are unused',
+        'Run PurgeCSS or `tailwindcss` with your real template/content globs, not a default config',
+        'Split global CSS into per-route or per-component bundles instead of one shared stylesheet',
+        'If using CSS-in-JS, confirm critical CSS extraction is enabled for SSR',
       ],
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}.`,
       auditKey: key,
       simpleExplanation: 'The page loads CSS that isn\'t used on this page.',
-      developerExplanation: `${bytesToLabel(savings)} of unused CSS loaded. Remove dead rules and split critical CSS.`,
+      developerExplanation: biggestName
+        ? `${biggestName} carries ${bytesToLabel(biggest?.wastedBytes || savings)} of unused rules (${bytesToLabel(savings)} total across all stylesheets). Remove dead rules and split critical CSS.`
+        : `${bytesToLabel(savings)} of unused CSS loaded. Remove dead rules and split critical CSS.`,
     };
   }
 
   if (key === 'unused-javascript') {
     const savings = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = fileNameOf(biggest?.url);
     return {
       title: "You're downloading JavaScript visitors don't immediately need",
+      resource: biggest?.url,
       impact: savings > 300_000 ? 'high' : savings > 100_000 ? 'medium' : 'low',
-      description: `About ${bytesToLabel(savings)} of JavaScript could potentially be avoided during the initial page load.`,
+      description: biggestName
+        ? `${biggestName} alone wastes about ${bytesToLabel(biggest?.wastedBytes || savings)}, out of ${bytesToLabel(savings)} total unused JavaScript.`
+        : `About ${bytesToLabel(savings)} of JavaScript could potentially be avoided during the initial page load.`,
       soWhat: 'Extra JavaScript blocks the main thread, delaying interactivity.',
       whatToDo: [
-        'Lazy-load large components',
+        biggestName ? `Start with ${biggestName}, the largest offender` : 'Lazy-load large components',
         'Split large bundles (code splitting)',
         'Remove unused dependencies',
         'Delay non-essential third-party scripts',
+      ],
+      devWhatToDo: [
+        'Wrap non-critical components in React.lazy() or dynamic(() => import(...))',
+        `Run a bundle analyzer (webpack-bundle-analyzer or next build --profile) to see what's actually in${biggestName ? ` ${biggestName}` : ' that chunk'}`,
+        'Check for duplicate package versions with `npm ls <package>`, a common source of bloat',
+        'Defer third-party scripts (Next.js: <Script strategy="lazyOnload">, otherwise defer/async)',
       ],
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}.`,
       auditKey: key,
       simpleExplanation: 'The page downloads more JavaScript than it needs right away.',
-      developerExplanation: `${bytesToLabel(savings)} of unused JavaScript in the initial bundle. Implement code splitting and lazy loading.`,
+      developerExplanation: biggestName
+        ? `${biggestName} alone accounts for ${bytesToLabel(biggest?.wastedBytes || savings)} of unused code (${bytesToLabel(savings)} total). Implement code splitting and lazy loading for this bundle specifically.`
+        : `${bytesToLabel(savings)} of unused JavaScript in the initial bundle. Implement code splitting and lazy loading.`,
     };
   }
 
@@ -877,6 +938,12 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Minify and compress JavaScript and CSS',
         'Remove unused code',
         'Lazy-load non-critical resources',
+      ],
+      devWhatToDo: [
+        'Sort the Network tab by size and tackle the top 3 resources first',
+        'Enable Brotli or gzip at your CDN/edge, check the content-encoding response header',
+        'Add an image CDN or next/image with automatic format negotiation',
+        'Add preconnect/dns-prefetch hints for third-party origins you can\'t remove',
       ],
       savingsBytes: wastedBytes,
       savingsLabel: bytesToLabel(wastedBytes),
@@ -902,6 +969,12 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Defer non-critical CSS with media queries or rel="preload"',
         'Reduce the size of render-blocking CSS',
       ],
+      devWhatToDo: [
+        'Extract above-the-fold CSS with `critical` or `criticters` and inline it in <head>',
+        'Load the rest via <link rel="preload" as="style" onload="this.rel=\'stylesheet\'">',
+        'Move blocking <script> tags to the end of <body> or add defer',
+        framework === 'Next.js' ? 'Use next/script with strategy="afterInteractive" for non-critical scripts' : 'Add defer or async to non-critical <script> tags',
+      ],
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}. Found ${cssItems.length} render-blocking CSS resource(s).`,
@@ -923,6 +996,11 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Use <picture> for art direction',
         framework === 'Next.js' ? 'Use Next.js <Image> with responsive sizes' : '',
       ].filter(Boolean),
+      devWhatToDo: [
+        'Generate 2-3 width variants per image (e.g. 640/1280/1920px) and serve via srcset',
+        'Set an accurate sizes attribute matching your actual CSS layout, not just viewport width',
+        framework === 'Next.js' ? 'next/image handles this automatically once sizes is set correctly' : 'Consider an image CDN that resizes on the fly via URL params',
+      ].filter(Boolean),
       savingsBytes: wastedBytes,
       savingsLabel: bytesToLabel(wastedBytes),
       details: `Lighthouse audit: ${title}.`,
@@ -934,63 +1012,99 @@ function createProblemByKey(audit: { key: string; title: string; description: st
 
   if (key === 'offscreen-images') {
     const savings = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = fileNameOf(biggest?.url);
     return {
       title: 'Images below the fold are loaded immediately',
+      resource: biggest?.url,
       impact: savings > 500_000 ? 'high' : savings > 100_000 ? 'medium' : 'low',
-      description: `About ${bytesToLabel(savings)} of images could be lazy-loaded since they aren't visible when the page first opens.`,
+      description: biggestName
+        ? `${biggestName} (${bytesToLabel(biggest?.size || biggest?.wastedBytes || savings)}) loads before it's visible, along with ${bytesToLabel(savings)} of offscreen images in total.`
+        : `About ${bytesToLabel(savings)} of images could be lazy-loaded since they aren't visible when the page first opens.`,
       soWhat: 'The browser downloads images the visitor can\'t even see yet.',
       whatToDo: [
-        'Add loading="lazy" to below-the-fold images',
+        biggestName ? `Add loading="lazy" to ${biggestName} and other below-the-fold images` : 'Add loading="lazy" to below-the-fold images',
         'Use Intersection Observer for custom lazy-loading',
         'Consider responsive loading strategies',
+      ],
+      devWhatToDo: [
+        'Add native loading="lazy" (supported everywhere now, no library needed)',
+        'For carousels/galleries, only mount images within a few slides of the visible one',
+        'Verify your actual LCP image is NOT lazy-loaded, it should have fetchpriority="high" instead',
       ],
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}.`,
       auditKey: key,
       simpleExplanation: 'The page loads images that are off-screen, wasting bandwidth.',
-      developerExplanation: `${bytesToLabel(savings)} of offscreen images eagerly loaded. Add loading="lazy" to defer them.`,
+      developerExplanation: biggestName
+        ? `${biggestName} is eagerly loaded despite being offscreen. Add loading="lazy" (${bytesToLabel(savings)} of offscreen images total).`
+        : `${bytesToLabel(savings)} of offscreen images eagerly loaded. Add loading="lazy" to defer them.`,
     };
   }
 
   if (key === 'unminified-css') {
     const savings = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = fileNameOf(biggest?.url);
     return {
       title: 'CSS is not minified',
+      resource: biggest?.url,
       impact: savings > 50_000 ? 'high' : savings > 10_000 ? 'medium' : 'low',
-      description: `About ${bytesToLabel(savings)} could be saved by minifying CSS.`,
+      description: biggestName
+        ? `${biggestName} isn't minified and could shrink by about ${bytesToLabel(biggest?.wastedBytes || savings)}.`
+        : `About ${bytesToLabel(savings)} could be saved by minifying CSS.`,
       soWhat: 'Unminified CSS takes longer to download and parse.',
       whatToDo: [
         'Minify CSS in your build process',
         'Use tools like cssnano or your framework\'s production mode',
+      ],
+      devWhatToDo: [
+        'Confirm NODE_ENV=production at build time, some bundlers skip minification otherwise',
+        'Add cssnano or postcss-preset-env with minify: true if using a custom build',
+        'Check your CDN isn\'t serving a stale unminified cached copy',
       ],
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}.`,
       auditKey: key,
       simpleExplanation: 'The CSS files are larger than they need to be because they aren\'t compressed.',
-      developerExplanation: `${bytesToLabel(savings)} of minification savings available. Enable production CSS minification.`,
+      developerExplanation: biggestName
+        ? `${biggestName} is unminified (${bytesToLabel(biggest?.wastedBytes || savings)} of savings available there alone). Enable production CSS minification.`
+        : `${bytesToLabel(savings)} of minification savings available. Enable production CSS minification.`,
     };
   }
 
   if (key === 'unminified-javascript') {
     const savings = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = fileNameOf(biggest?.url);
     return {
       title: 'JavaScript is not minified',
+      resource: biggest?.url,
       impact: savings > 100_000 ? 'high' : savings > 30_000 ? 'medium' : 'low',
-      description: `About ${bytesToLabel(savings)} could be saved by minifying JavaScript.`,
+      description: biggestName
+        ? `${biggestName} isn't minified and could shrink by about ${bytesToLabel(biggest?.wastedBytes || savings)}.`
+        : `About ${bytesToLabel(savings)} could be saved by minifying JavaScript.`,
       soWhat: 'Unminified JavaScript takes longer to download and parse on the main thread.',
       whatToDo: [
         'Minify JavaScript in your build process',
         'Enable production mode in your framework',
         'Use Terser, esbuild, or your bundler\'s minifier',
       ],
+      devWhatToDo: [
+        'Confirm NODE_ENV=production, staging environments sometimes ship dev builds by mistake',
+        'Check optimization.minimize isn\'t disabled in a custom webpack/esbuild config',
+        'Verify source maps aren\'t accidentally inflating the shipped file size',
+      ],
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}.`,
       auditKey: key,
       simpleExplanation: 'The JavaScript files are larger than they need to be.',
-      developerExplanation: `${bytesToLabel(savings)} of minification savings available. Enable JS minification in production builds.`,
+      developerExplanation: biggestName
+        ? `${biggestName} is unminified (${bytesToLabel(biggest?.wastedBytes || savings)} of savings available there alone). Enable JS minification in production builds.`
+        : `${bytesToLabel(savings)} of minification savings available. Enable JS minification in production builds.`,
     };
   }
 
@@ -998,9 +1112,10 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
     const seconds = typeof value === 'number' && value < 10 ? value : value / 1000;
+    if (seconds <= 1.8) return null; // already good, nothing to report
     return {
-      title: 'Your main content appears too late',
-      impact: seconds > 2 ? 'high' : seconds > 1 ? 'medium' : 'low',
+      title: scoresWell ? 'Main content could appear a bit sooner' : 'Your main content appears too late',
+      impact: seconds > 3.0 ? 'high' : 'low',
       description: `The largest visible element appears at ${typeof seconds === 'number' && seconds < 10 ? seconds.toFixed(1) + 's' : (seconds).toFixed(1) + 's'}. Visitors wait too long for the main content.`,
       soWhat: 'Users perceive the page as slow when the main content takes too long to show.',
       whatToDo: [
@@ -1010,6 +1125,12 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Remove render-blocking resources',
         'Reduce main-thread work',
         framework === 'Next.js' ? 'Use Next.js <Image> with priority for the LCP image' : '',
+      ].filter(Boolean),
+      devWhatToDo: [
+        'Find the LCP element in DevTools Performance panel (Timings > LCP)',
+        'If it\'s an image: add fetchpriority="high" and <link rel="preload" as="image">',
+        'If it\'s text: check the font isn\'t render-blocking (font-display: swap + preload the file)',
+        framework === 'Next.js' ? 'Set priority on the LCP <Image> so it skips lazy-loading' : 'Preload the hero asset with <link rel="preload">',
       ].filter(Boolean),
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1024,16 +1145,23 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
     const seconds = typeof value === 'number' && value < 100 ? value : value / 1000;
+    if (seconds <= 0.8) return null; // already good, nothing to report
     return {
-      title: 'The server takes too long to respond',
-      impact: seconds > 1.5 ? 'high' : seconds > 0.8 ? 'medium' : 'low',
-      description: `The server responds in about ${seconds.toFixed(1)}s. Everything else waits on this.`,
+      title: scoresWell ? 'Server response could be a bit faster' : 'The server takes too long to respond',
+      impact: seconds > 1.5 ? 'high' : 'low',
+      description: `The server responds in about ${seconds.toFixed(1)}s. Everything else waits on this. Lighthouse doesn't factor server response time directly into your performance score, so this can stay hidden even on a page that scores well.`,
       soWhat: 'A slow server delays every other metric: FCP, LCP, and interactivity all suffer.',
       whatToDo: [
         'Use a CDN to serve static assets closer to visitors',
         'Optimize server-side rendering or caching',
         'Upgrade hosting if the server itself is slow',
         'Reduce backend query time',
+      ],
+      devWhatToDo: [
+        'Check the TTFB breakdown in DevTools Network tab (DNS / Connect / SSL / Wait)',
+        'Add server-side caching (Redis or an edge cache) for expensive queries or SSR renders',
+        'Move static/SSG-able pages off SSR where possible (getStaticProps or ISR in Next.js)',
+        'Check for N+1 queries or missing database indexes if the backend is the bottleneck',
       ],
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1044,12 +1172,13 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     };
   }
 
-  if (key === 'main-thread-work') {
+  if (key === 'mainthread-work-breakdown') {
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
+    if (value <= 2000) return null; // already good, nothing to report
     return {
-      title: 'Too much work is happening on the main thread',
-      impact: value > 2500 ? 'high' : value > 1000 ? 'medium' : 'low',
+      title: scoresWell ? 'Main-thread work could be trimmed down' : 'Too much work is happening on the main thread',
+      impact: value > 4000 ? 'high' : 'low',
       description: `The browser\'s main thread is busy for about ${value.toFixed(0)}ms during load. This delays interactivity.`,
       soWhat: 'Visitors can\'t click or scroll smoothly because the browser is busy processing JavaScript.',
       whatToDo: [
@@ -1057,6 +1186,12 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Move work off the main thread with Web Workers where possible',
         'Reduce unnecessary JavaScript execution',
         'Defer non-critical scripts',
+      ],
+      devWhatToDo: [
+        'Use DevTools Performance panel to find tasks over 50ms, flagged as "Long Tasks"',
+        'Break large loops/renders into chunks with requestIdleCallback or scheduler.postTask',
+        'Move CPU-heavy work (parsing, sorting large lists) to a Web Worker',
+        'Check for layout thrashing: reading then writing DOM properties in a loop',
       ],
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1067,12 +1202,13 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     };
   }
 
-  if (key === 'javascript-execution') {
+  if (key === 'bootup-time') {
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
+    if (value <= 2000) return null; // already good, nothing to report
     return {
-      title: 'JavaScript execution is taking too long',
-      impact: value > 2500 ? 'high' : value > 1000 ? 'medium' : 'low',
+      title: scoresWell ? 'JavaScript execution could be a bit leaner' : 'JavaScript execution is taking too long',
+      impact: value > 3500 ? 'high' : 'low',
       description: `JavaScript execution takes about ${value.toFixed(0)}ms. This blocks the page from becoming interactive.`,
       soWhat: 'Long execution times delay when visitors can actually use the page.',
       whatToDo: [
@@ -1080,6 +1216,11 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Defer non-essential scripts',
         'Optimize expensive computations',
         'Consider server-side rendering for heavier logic',
+      ],
+      devWhatToDo: [
+        'Profile in DevTools Performance, check "Scripting" time in the summary panel',
+        'Look for large third-party SDKs (analytics, chat widgets) loaded synchronously; defer them',
+        'Tree-shake unused exports, set "sideEffects": false in package.json where accurate',
       ],
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1093,9 +1234,10 @@ function createProblemByKey(audit: { key: string; title: string; description: st
   if (key === 'total-blocking-time') {
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
+    if (value <= 200) return null; // already good, nothing to report
     return {
-      title: 'The page becomes interactive slowly',
-      impact: value > 600 ? 'high' : value > 200 ? 'medium' : 'low',
+      title: scoresWell ? 'The page could respond a bit faster' : 'The page becomes interactive slowly',
+      impact: value > 600 ? 'high' : 'low',
       description: `Total Blocking Time is ${value.toFixed(0)}ms. This measures how long the main thread is blocked after the page starts loading.`,
       soWhat: 'Visitors try to interact with the page but it doesn\'t respond because JavaScript is blocking.',
       whatToDo: [
@@ -1103,6 +1245,11 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Break up long tasks',
         'Defer non-critical scripts',
         'Optimize third-party scripts',
+      ],
+      devWhatToDo: [
+        'Same root cause as main-thread work: find Long Tasks (>50ms) in DevTools Performance',
+        'Audit third-party scripts individually, analytics/ad tags are often the biggest single contributor',
+        'Use requestIdleCallback for non-urgent initialization code',
       ],
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1116,9 +1263,10 @@ function createProblemByKey(audit: { key: string; title: string; description: st
   if (key === 'cumulative-layout-shift') {
     const value = numericValue || 0;
     if (!value) return null;
+    if (value <= 0.1) return null; // already good, nothing to report
     return {
-      title: 'Elements shift around while the page loads',
-      impact: value > 0.25 ? 'high' : value > 0.1 ? 'medium' : 'low',
+      title: scoresWell ? 'A little layout shift could be tightened up' : 'Elements shift around while the page loads',
+      impact: value > 0.25 ? 'high' : 'low',
       description: `Cumulative Layout Shift is ${value.toFixed(2)}. Content moves unexpectedly, which frustrates visitors.`,
       soWhat: 'Visitors click the wrong thing when buttons or links move under them.',
       whatToDo: [
@@ -1126,6 +1274,12 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Reserve space for ads and dynamic content',
         'Avoid inserting content above existing content',
         'Use font-display: swap carefully with size-adjust',
+      ],
+      devWhatToDo: [
+        'Add explicit width/height or aspect-ratio on every <img> and <iframe>',
+        'Reserve space for ads/embeds with a fixed-size container before they load',
+        'Use font-display: optional or preload web fonts to avoid FOIT/FOUT shifts',
+        'Check DevTools > Rendering > "Layout Shift Regions" to see exactly what\'s moving',
       ],
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1140,9 +1294,10 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
     const seconds = typeof value === 'number' && value < 100 ? value : value / 1000;
+    if (seconds <= 1.2) return null; // already good, nothing to report
     return {
-      title: 'The page takes too long to visually populate',
-      impact: seconds > 2.5 ? 'high' : seconds > 1.2 ? 'medium' : 'low',
+      title: scoresWell ? 'The page could visually fill in a bit faster' : 'The page takes too long to visually populate',
+      impact: seconds > 2.5 ? 'high' : 'low',
       description: `Speed Index is ${seconds.toFixed(1)}s. This measures how quickly the visible parts of the page appear.`,
       soWhat: 'Visitors see a mostly blank or partially loaded page for too long.',
       whatToDo: [
@@ -1150,6 +1305,11 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Reduce render-blocking resources',
         'Improve LCP',
         'Use a CDN and optimize server response',
+      ],
+      devWhatToDo: [
+        'Speed Index is downstream of FCP/LCP, fixing those usually fixes this too',
+        'Check the Lighthouse "Filmstrip" view to see which frame is slow to fill in',
+        'Reduce main-thread contention during paint (see Total Blocking Time fixes)',
       ],
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1164,9 +1324,10 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
     const seconds = typeof value === 'number' && value < 100 ? value : value / 1000;
+    if (seconds <= 0.8) return null; // already good, nothing to report
     return {
-      title: 'The first content appears slowly',
-      impact: seconds > 1.8 ? 'high' : seconds > 0.8 ? 'medium' : 'low',
+      title: scoresWell ? 'First content could appear a bit sooner' : 'The first content appears slowly',
+      impact: seconds > 1.8 ? 'high' : 'low',
       description: `First Contentful Paint is ${seconds.toFixed(1)}s. This is when the browser first renders text or an image.`,
       soWhat: 'Visitors stare at a blank or loading screen longer than they should.',
       whatToDo: [
@@ -1174,6 +1335,11 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Improve server response time',
         'Optimize the critical rendering path',
         'Preload critical assets',
+      ],
+      devWhatToDo: [
+        'Check TTFB first, FCP can never beat server response time',
+        'Inline critical CSS (see render-blocking-resources fix) to unblock first paint',
+        'Preload the font and hero asset with <link rel="preload">',
       ],
       savingsBytes: undefined,
       savingsLabel: undefined,
@@ -1186,22 +1352,34 @@ function createProblemByKey(audit: { key: string; title: string; description: st
 
   if (key === 'uses-legacy-javascript') {
     const savings = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = fileNameOf(biggest?.url);
     return {
       title: 'The page uses old JavaScript syntax',
+      resource: biggest?.url,
       impact: savings > 100_000 ? 'medium' : 'low',
-      description: `About ${bytesToLabel(savings)} of legacy JavaScript is loaded. Modern browsers don't need it.`,
+      description: biggestName
+        ? `${biggestName} ships legacy syntax that modern browsers don't need (about ${bytesToLabel(biggest?.wastedBytes || savings)}).`
+        : `About ${bytesToLabel(savings)} of legacy JavaScript is loaded. Modern browsers don't need it.`,
       soWhat: 'Older JavaScript syntax adds unnecessary bytes for modern visitors.',
       whatToDo: [
         'Remove or update polyfills for modern browsers',
         'Use module/nomodule pattern',
         'Target modern JavaScript in your build',
       ],
+      devWhatToDo: [
+        'Set your bundler\'s browserslist target to modern browsers (e.g. "> 0.5%, last 2 versions")',
+        'Use <script type="module"> for the modern bundle plus a nomodule fallback for legacy',
+        'Check for core-js polyfills you may not need if you\'re not supporting IE11',
+      ],
       savingsBytes: savings,
       savingsLabel: bytesToLabel(savings),
       details: `Lighthouse audit: ${title}.`,
       auditKey: key,
       simpleExplanation: 'The page loads old JavaScript that modern browsers don\'t need.',
-      developerExplanation: `${bytesToLabel(savings)} of legacy JS loaded. Use module/nomodule split and target modern syntax.`,
+      developerExplanation: biggestName
+        ? `${biggestName} contains legacy syntax/polyfills (${bytesToLabel(biggest?.wastedBytes || savings)} of ${bytesToLabel(savings)} total). Use module/nomodule split and target modern syntax.`
+        : `${bytesToLabel(savings)} of legacy JS loaded. Use module/nomodule split and target modern syntax.`,
     };
   }
 
@@ -1215,6 +1393,10 @@ function createProblemByKey(audit: { key: string; title: string; description: st
       whatToDo: [
         'Review the Lighthouse audit details for this issue',
         'Follow the specific recommendation for this audit',
+      ],
+      devWhatToDo: [
+        `Run npx lighthouse <url> --view locally to inspect the "${key}" audit's raw item list`,
+        'Check the Lighthouse docs for this specific audit ID for the recommended fix',
       ],
       savingsBytes: wastedBytes,
       savingsLabel: bytesToLabel(wastedBytes),

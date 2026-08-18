@@ -115,17 +115,6 @@ function getProblemIcon(auditKey: string) {
   return Zap;
 }
 
-const VERDICT_LABEL: Record<string, string> = {
-  'fix-now': 'Fix now',
-  'fix-next': 'Fix next',
-};
-
-const EFFORT_LABEL: Record<string, string> = {
-  easy: 'Quick fix',
-  medium: 'Some work',
-  hard: 'Bigger project',
-};
-
 export function ProblemCard({
   problem,
   index,
@@ -154,17 +143,6 @@ export function ProblemCard({
           <h3 className="text-base font-semibold text-foreground leading-snug">
             {problem.title}
           </h3>
-
-          <div className="mt-1.5 flex items-center gap-2 flex-wrap">
-            <span
-              className={`text-xs font-medium px-2 py-0.5 rounded-full ${
-                problem.verdict === 'fix-now' ? 'bg-primary/25 text-foreground' : 'bg-muted text-muted-foreground'
-              }`}
-            >
-              {VERDICT_LABEL[problem.verdict] || 'Worth fixing'}
-            </span>
-            <span className="text-xs text-muted-foreground">{EFFORT_LABEL[problem.effort] || 'Some work'}</span>
-          </div>
 
           {problem.resource && (
             <div className="mt-1.5 text-xs text-muted-foreground font-mono truncate">
@@ -216,10 +194,10 @@ export function ProblemCard({
               What to do
             </div>
             <ul className="space-y-1.5">
-              {problem.whatToDo.map((item: string, i: number) => (
+              {(verbosity === 'simple' ? problem.whatToDo : (problem.devWhatToDo || problem.whatToDo)).map((item: string, i: number) => (
                 <li key={i} className="text-sm text-foreground flex items-start gap-2 leading-relaxed">
                   <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0 text-primary" fill="currentColor" fillOpacity={0.15} />
-                  <span>{item}</span>
+                  <span className={verbosity === 'developer' ? 'font-mono text-[13px]' : ''}>{item}</span>
                 </li>
               ))}
             </ul>

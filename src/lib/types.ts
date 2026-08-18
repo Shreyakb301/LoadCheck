@@ -101,6 +101,7 @@ export interface Problem {
   description: string;
   soWhat: string;
   whatToDo: string[];
+  devWhatToDo: string[];
   savingsBytes?: number;
   savingsLabel?: string;
   details: string;
