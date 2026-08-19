@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Report, APIResponse, bytesToLabel } from '@/lib/types';
+import { normalizeAndValidateUrl, isBlockedHost } from '@/lib/url-validation';
+import { runLighthouse } from '@/lib/lighthouse-runner';
 
-const PS_API_BASE_URL = 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed';
+const CRUX_API_URL = 'https://chromeuxreport.googleapis.com/v1/records:queryRecord';
 
 interface RawAudit {
   title: string;
@@ -15,6 +17,7 @@ interface RawAudit {
       size?: number;
       wastedBytes?: number;
       wastedMS?: number;
+      wastedMs?: number;
       resourceSize?: number;
       resourceBytes?: number;
       totalBytes?: number;
@@ -22,6 +25,10 @@ interface RawAudit {
       node?: string;
       snippet?: string;
       displayString?: string;
+      entity?: string | { type?: string; text?: string; url?: string };
+      transferSize?: number;
+      blockingTime?: number;
+      mainThreadTime?: number;
       reasons?: {
         items?: Array<{
           size?: number;
@@ -41,6 +48,16 @@ interface RawAudit {
       bytes?: number;
       ms?: number;
       score?: number;
+    };
+    summary?: {
+      wastedBytes?: number;
+      wastedMs?: number;
+    };
+    chains?: Record<string, unknown>;
+    longestChain?: {
+      duration?: number;
+      length?: number;
+      transferSize?: number;
     };
     overall?: number;
     baseScore?: number;
@@ -87,24 +104,6 @@ interface CrUXLoadingExperience {
   overall_category?: 'FAST' | 'AVERAGE' | 'SLOW';
 }
 
-interface PageSpeedResponseRaw {
-  kind: string;
-  status: string;
-  title: string;
-  score?: number;
-  _url: string;
-  lighthouseResult?: LighthouseResult;
-  loadingExperience?: CrUXLoadingExperience;
-  originLoadingExperience?: CrUXLoadingExperience;
-  pageResolution?: string;
-  analysisType?: string;
-  fieldsMissing?: boolean;
-  errorIssues?: Array<{
-    code: string;
-    message: string;
-  }>;
-}
-
 function extractNumericValue(audit: RawAudit): number | null {
   if (typeof audit.numericValue === 'number') return audit.numericValue;
   if (typeof audit.score === 'number' && audit.numericUnit) return audit.score;
@@ -116,6 +115,10 @@ function extractWastedBytes(audit: RawAudit): number {
 
   if (audit.details?.totals?.bytes) {
     total += audit.details.totals.bytes;
+  }
+
+  if (audit.details?.summary?.wastedBytes) {
+    total += audit.details.summary.wastedBytes;
   }
 
   if (Array.isArray(audit.details?.items)) {
@@ -147,10 +150,16 @@ function extractWastedMs(audit: RawAudit): number {
     total += audit.details.totals.ms;
   }
 
+  if (audit.details?.summary?.wastedMs) {
+    total += audit.details.summary.wastedMs;
+  }
+
   if (Array.isArray(audit.details?.items)) {
     for (const item of audit.details.items) {
       if (typeof item.wastedMS === 'number') total += item.wastedMS;
+      else if (typeof item.wastedMs === 'number') total += item.wastedMs;
       if (typeof item.totalMS === 'number') total += item.totalMS;
+      if (typeof item.mainThreadTime === 'number') total += item.mainThreadTime;
     }
   }
 
@@ -167,10 +176,17 @@ function extractItems(audit: RawAudit): Array<{ url?: string; name?: string; siz
 
     if (typeof item.url === 'string') entry.url = item.url;
     if (typeof item.title === 'string') entry.name = item.title;
+    if (!entry.name && typeof item.entity === 'string') entry.name = item.entity;
+    if (!entry.name && typeof item.entity === 'object' && typeof item.entity?.text === 'string') entry.name = item.entity.text;
     if (typeof item.size === 'number') entry.size = item.size;
     if (typeof item.resourceSize === 'number') entry.size = item.resourceSize;
+    if (entry.size === undefined && typeof item.transferSize === 'number') entry.size = item.transferSize;
+    if (entry.size === undefined && typeof item.totalBytes === 'number') entry.size = item.totalBytes;
     if (typeof item.wastedBytes === 'number') entry.wastedBytes = item.wastedBytes;
     if (typeof item.wastedMS === 'number') entry.wastedMS = item.wastedMS;
+    else if (typeof item.wastedMs === 'number') entry.wastedMS = item.wastedMs;
+    if (entry.wastedMS === undefined && typeof item.blockingTime === 'number') entry.wastedMS = item.blockingTime;
+    if (entry.wastedMS === undefined && typeof item.mainThreadTime === 'number') entry.wastedMS = item.mainThreadTime;
 
     if (Array.isArray(item.reasons?.items)) {
       for (const reason of item.reasons.items) {
@@ -354,7 +370,7 @@ const POSITIVE_AUDIT_COPY: Record<string, { title: string; description: string }
     title: 'JavaScript is lean',
     description: 'You\'re not shipping much unused JavaScript.',
   },
-  'render-blocking-resources': {
+  'render-blocking-insight': {
     title: 'Nothing blocks the first paint',
     description: 'No render-blocking resources are delaying the page from rendering.',
   },
@@ -366,23 +382,11 @@ const POSITIVE_AUDIT_COPY: Record<string, { title: string; description: string }
     title: 'JavaScript is minified',
     description: 'Your JavaScript is already compressed for production.',
   },
-  'offscreen-images': {
-    title: 'Offscreen images are handled well',
-    description: 'Images aren\'t downloaded before they\'re needed.',
+  'image-delivery-insight': {
+    title: 'Images are delivered efficiently',
+    description: 'Your images are appropriately sized and compressed for how they\'re displayed.',
   },
-  'uses-responsive-images': {
-    title: 'Images are sized appropriately',
-    description: 'Visitors aren\'t downloading oversized images.',
-  },
-  'uses-optimized-images': {
-    title: 'Images are optimized',
-    description: 'Your images are already compressed efficiently.',
-  },
-  'next-gen-formats': {
-    title: 'Images use modern formats',
-    description: 'Your images are served in efficient, modern formats.',
-  },
-  'uses-legacy-javascript': {
+  'legacy-javascript-insight': {
     title: 'No legacy JavaScript',
     description: 'You\'re not shipping unnecessary polyfills to modern browsers.',
   },
@@ -403,80 +407,151 @@ function getAuditPositives(parsedAudits: ReturnType<typeof parseAudits>, exclude
   return positives;
 }
 
-export async function analyzeURL(url: string): Promise<APIResponse> {
-  if (!url || typeof url !== 'string') {
-    return { success: false, error: 'URL is required' };
-  }
+// Quick reachability check so a dead/unreachable site fails in seconds instead of burning
+// the full ~60s PageSpeed timeout. Only network-level failures (DNS, connection refused,
+// no response in time) count as unreachable, any actual HTTP response (even 404 or 500)
+// means the host is up, so PageSpeed gets a chance to analyze it.
+// Kept short: the route's total execution budget (maxDuration = 60s) has to cover this check
+// plus the actual PageSpeed call below, so this can't eat too much of that budget.
+const REACHABILITY_TIMEOUT_MS = 5000;
 
-  let normalizedUrl = url.trim();
+// Bounds the worst case: each hop gets its own REACHABILITY_TIMEOUT_MS, and this check needs to
+// stay small relative to the PSI/Lighthouse budgets that follow it.
+const MAX_REDIRECTS = 3;
 
-  // Add protocol if missing
-  if (!normalizedUrl.startsWith('http://') && !normalizedUrl.startsWith('https://')) {
-    normalizedUrl = 'https://' + normalizedUrl;
-  }
-
-  // Validate URL
+export async function checkReachable(normalizedUrl: string): Promise<{ reachable: true } | { reachable: false; error: string }> {
+  // GET rather than HEAD: some servers reject HEAD at the connection level (not even a 405
+  // response), and GET is the more universally supported method for a one-shot reachability probe.
+  //
+  // redirect: 'manual' + a hand-rolled loop, not 'follow': a URL can look public but redirect to
+  // an internal address (cloud metadata endpoints, localhost, an internal service). We only
+  // block hosts at the URL a user typed in, so blindly following redirects would let that
+  // straight through to a real network request. Each hop gets re-validated the same way.
   try {
-    new URL(normalizedUrl);
-  } catch {
-    return { success: false, error: 'That doesn\'t look like a valid URL. Include the full address, like https://example.com' };
-  }
+    let currentUrl = normalizedUrl;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      const response = await fetch(currentUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(REACHABILITY_TIMEOUT_MS),
+      });
 
-  // Block localhost and private IPs
-  const host = new URL(normalizedUrl).hostname;
-  if (host === 'localhost' || host === '127.0.0.1' || host.includes('.local') || host.startsWith('192.168.') || host.startsWith('10.') || host.startsWith('172.')) {
-    return { success: false, error: 'We can only analyze public websites. Localhost and private networks aren\'t reachable from our servers.' };
-  }
-
-  try {
-    const urlParams = new URLSearchParams({
-      url: normalizedUrl,
-      category: 'performance',
-      strategy: 'mobile',
-    });
-    if (process.env.PAGESPEED_API_KEY) {
-      urlParams.set('key', process.env.PAGESPEED_API_KEY);
-    }
-    const response = await fetch(`${PS_API_BASE_URL}?${urlParams.toString()}`, {
-      headers: {
-        'Accept': 'application/json',
-      },
-      signal: AbortSignal.timeout(60000),
-    });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        return { success: false, error: 'Google\'s analysis service is rate-limiting requests right now. This usually means the daily quota for the API key has been reached. Try again later, or set up your own Google Cloud API key with a higher quota at https://console.cloud.google.com/ (free).' };
-      }
-      if (response.status === 400) {
-        const text = await response.text();
-        if (text.includes('API key not valid')) {
-          return { success: false, error: 'The API key configured for this app isn\'t valid. The site owner needs to add a valid Google PageSpeed Insights API key. See README for setup instructions.' };
+      if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+        if (hop === MAX_REDIRECTS) {
+          return { reachable: false, error: 'This website redirects too many times. It may be misconfigured.' };
         }
-        return { success: false, error: `Google couldn't analyze this URL. It may be blocked, require authentication, or be unreachable. (${text.slice(0, 100)})` };
+        const nextUrl = new URL(response.headers.get('location')!, currentUrl);
+        if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
+          return { reachable: false, error: 'We can only analyze http:// and https:// URLs.' };
+        }
+        if (isBlockedHost(nextUrl.hostname)) {
+          return { reachable: false, error: 'We can only analyze public websites. Localhost and private networks aren\'t reachable from our servers.' };
+        }
+        response.body?.cancel();
+        currentUrl = nextUrl.toString();
+        continue;
       }
-      return { success: false, error: `Google's analysis service returned an error (${response.status}). Please try again later.` };
+
+      response.body?.cancel();
+      return { reachable: true };
+    }
+    return { reachable: false, error: 'This website redirects too many times. It may be misconfigured.' };
+  } catch (err) {
+    const name = err instanceof Error ? err.name : '';
+    if (name === 'AbortError' || name === 'TimeoutError') {
+      return { reachable: false, error: `This website didn't respond within ${REACHABILITY_TIMEOUT_MS / 1000} seconds. It may be down, very slow, or blocking automated requests.` };
     }
 
-    const data: PageSpeedResponseRaw = await response.json();
-
-    if (data.errorIssues && data.errorIssues.length > 0) {
-      const msg = data.errorIssues.map(e => e.message).join('. ');
-      return { success: false, error: msg || 'Google returned an error analyzing this URL.' };
+    // Node's fetch (undici) exposes the underlying DNS/socket error on `cause`. ENOTFOUND
+    // specifically means the domain doesn't resolve at all (no such domain), distinct from a
+    // domain that resolves but refuses the connection, times out, or has a bad certificate.
+    // (EAI_AGAIN is a transient resolver hiccup, not "doesn't exist", so it's left out of this
+    // and falls through to the generic message below.)
+    const cause = err instanceof Error ? (err.cause as { code?: string } | undefined) : undefined;
+    if (cause?.code === 'ENOTFOUND') {
+      return { reachable: false, error: 'This website doesn\'t exist. Double-check the domain name for typos.' };
     }
 
-    if (!data.lighthouseResult) {
-      if (data.fieldsMissing) {
-        return { success: false, error: 'The analysis didn\'t complete. Google may have timed out or the page may have blocked the analysis.' };
-      }
-      if (data.status === 'invalid') {
-        return { success: false, error: 'Google couldn\'t analyze this URL. It may be blocked, require login, or be unreachable.' };
-      }
-      return { success: false, error: 'The analysis didn\'t return results. The website may block automated testing.' };
-    }
+    return { reachable: false, error: 'We couldn\'t reach this website. Double-check the URL is correct and the site is publicly accessible.' };
+  }
+}
 
-    const lighthouse = data.lighthouseResult;
-    const audits = lighthouse.audits || {};
+// runLighthouse's own maxWaitForLoad only bounds the page-load phase; this bounds the whole
+// operation (Chrome launch + navigation + audit computation) so a slow post-load phase can't
+// blow the route's overall time budget. Doesn't cancel the underlying run, it just stops
+// waiting on it, the browser still closes itself once that run finishes in the background.
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(Object.assign(new Error(`Timed out after ${ms}ms`), { name: 'TimeoutError' }));
+    }, ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+// Best-effort: field data is a nice-to-have comparison, not something the analysis should ever
+// fail over. Requires the Chrome UX Report API to be enabled for PAGESPEED_API_KEY separately
+// from the PageSpeed Insights API; if it isn't (or the URL has no CrUX data, which is common for
+// smaller sites), this quietly returns {} and the report just omits the field comparison.
+async function fetchCruxFieldData(normalizedUrl: string): Promise<{ loadingExperience?: CrUXLoadingExperience; originLoadingExperience?: CrUXLoadingExperience }> {
+  if (!process.env.PAGESPEED_API_KEY) return {};
+
+  const queryCrux = async (body: Record<string, string>): Promise<CrUXLoadingExperience | undefined> => {
+    try {
+      const res = await fetch(`${CRUX_API_URL}?key=${process.env.PAGESPEED_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, formFactor: 'PHONE' }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) return undefined;
+      const data = await res.json();
+      const rawMetrics = data?.record?.metrics;
+      if (!rawMetrics) return undefined;
+
+      const toMetric = (m: { percentiles?: { p75?: number } } | undefined, thresholds: [number, number]): CrUXMetric | undefined => {
+        const percentile = m?.percentiles?.p75;
+        if (typeof percentile !== 'number') return undefined;
+        const category = percentile <= thresholds[0] ? 'FAST' : percentile <= thresholds[1] ? 'AVERAGE' : 'SLOW';
+        return { percentile, category };
+      };
+
+      return {
+        metrics: {
+          LARGEST_CONTENTFUL_PAINT_MS: toMetric(rawMetrics.largest_contentful_paint, [2500, 4000]),
+          CUMULATIVE_LAYOUT_SHIFT_SCORE: toMetric(rawMetrics.cumulative_layout_shift, [0.1, 0.25]),
+          FIRST_CONTENTFUL_PAINT_MS: toMetric(rawMetrics.first_contentful_paint, [1800, 3000]),
+        },
+      };
+    } catch {
+      return undefined;
+    }
+  };
+
+  try {
+    const origin = new URL(normalizedUrl).origin;
+    const [pageResult, originResult] = await Promise.all([
+      queryCrux({ url: normalizedUrl }),
+      queryCrux({ origin }),
+    ]);
+    return { loadingExperience: pageResult, originLoadingExperience: originResult };
+  } catch {
+    return {};
+  }
+}
+
+// Shared by both the PageSpeed Insights path and the self-hosted Lighthouse fallback: turns a
+// Lighthouse report (whichever produced it) into our own report shape. Assumes `lighthouse` has
+// already been checked for runtimeError/empty audits by the caller.
+function buildReportFromLighthouse(
+  lighthouse: LighthouseResult,
+  fieldData: { loadingExperience?: CrUXLoadingExperience; originLoadingExperience?: CrUXLoadingExperience },
+  normalizedUrl: string
+): Report {
+    const audits = lighthouse.audits;
     const parsedAudits = parseAudits(audits);
 
     const score = parseScore(lighthouse.categories?.performance?.score);
@@ -527,13 +602,13 @@ export async function analyzeURL(url: string): Promise<APIResponse> {
     }
 
     // Also check for image-specific audit items
-    const imageAudits = ['uses-optimized-images', 'serve-images-webp', 'efficient-images', 'uses-responsive-images', 'offscreen-images', 'next-gen-formats'];
+    const imageAudits = ['image-delivery-insight'];
     for (const key of imageAudits) {
       const audit = audits[key];
       if (!Array.isArray(audit?.details?.items)) continue;
       for (const item of audit.details.items) {
         if (!item.url) continue;
-        const size = typeof item.size === 'number' ? item.size : typeof item.resourceSize === 'number' ? item.resourceSize : 0;
+        const size = typeof item.size === 'number' ? item.size : typeof item.resourceSize === 'number' ? item.resourceSize : typeof item.totalBytes === 'number' ? item.totalBytes : 0;
         if (size > 0) {
           const category = 'Images';
           categories[category].totalBytes += size;
@@ -566,13 +641,13 @@ export async function analyzeURL(url: string): Promise<APIResponse> {
     resourceItems.sort((a, b) => b.size - a.size);
 
     // Build problems using diagnosis engine
-    const { worthFixing, notWorthFixing, allAuditKeys } = buildProblems(parsedAudits, framework, 'simple', performanceScore);
+    const { worthFixing, notWorthFixing, allAuditKeys } = buildProblems(parsedAudits, framework, 'simple', performanceScore, audits);
 
     const auditPositives = getAuditPositives(parsedAudits, new Set(allAuditKeys));
     const positives = [...metricPositives, ...auditPositives].slice(0, 6);
 
     const labLcp = metrics.find(m => m.label === 'LCP')?.value ?? null;
-    const fieldComparison = buildFieldComparison(data, labLcp);
+    const fieldComparison = buildFieldComparison(fieldData, labLcp);
 
     let headline: string;
     let headlineDetail: string | null;
@@ -590,29 +665,139 @@ export async function analyzeURL(url: string): Promise<APIResponse> {
       headlineDetail = `${worthFixing[0].title}. Start there.`;
     }
 
-    return {
-      success: true,
-      report: {
-        url: normalizedUrl,
-        performanceScore,
-        headline,
-        headlineDetail,
-        metrics,
-        problems: worthFixing,
-        notWorthFixing,
-        positives,
-        fieldComparison,
-        resourceCategories,
-        resourceItems: resourceItems.slice(0, 20),
-        framework,
-        fetchedAt: new Date().toISOString(),
-      },
-    };
+  return {
+    url: normalizedUrl,
+    performanceScore,
+    headline,
+    headlineDetail,
+    metrics,
+    problems: worthFixing,
+    notWorthFixing,
+    positives,
+    fieldComparison,
+    resourceCategories,
+    resourceItems: resourceItems.slice(0, 20),
+    framework,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+const PS_API_BASE_URL = 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed';
+
+// The original approach: ask Google's hosted PageSpeed Insights API to run Lighthouse for us.
+// Usually fine, but Google's queue can get slow or rate-limited under load. Throws on any
+// failure (network, timeout, non-2xx, missing result) so the caller can uniformly fall back
+// to running Lighthouse ourselves rather than needing to branch on every failure mode here.
+async function runPageSpeedInsights(normalizedUrl: string, timeoutMs: number): Promise<LighthouseResult> {
+  const urlParams = new URLSearchParams({
+    url: normalizedUrl,
+    category: 'performance',
+    strategy: 'mobile',
+  });
+  if (process.env.PAGESPEED_API_KEY) {
+    urlParams.set('key', process.env.PAGESPEED_API_KEY);
+  }
+
+  const response = await fetch(`${PS_API_BASE_URL}?${urlParams.toString()}`, {
+    headers: { 'Accept': 'application/json' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    throw new Error(`PageSpeed Insights returned ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  if (data.errorIssues && data.errorIssues.length > 0) {
+    throw new Error(data.errorIssues.map((e: { message: string }) => e.message).join('. '));
+  }
+  if (!data.lighthouseResult) {
+    throw new Error('PageSpeed Insights returned no lighthouseResult');
+  }
+
+  return data.lighthouseResult as LighthouseResult;
+}
+
+async function runSelfHostedLighthouse(normalizedUrl: string, timeoutMs: number): Promise<LighthouseResult> {
+  const raw = await withTimeout(runLighthouse(normalizedUrl, timeoutMs), timeoutMs);
+  return raw as LighthouseResult;
+}
+
+function validateLighthouseResult(lighthouse: LighthouseResult): string | null {
+  if (lighthouse.runtimeError) {
+    return `The analysis couldn't complete: ${lighthouse.runtimeError.message || lighthouse.runtimeError.code}. The page may block automated browsers or require login.`;
+  }
+  if (!lighthouse.audits || Object.keys(lighthouse.audits).length === 0) {
+    return 'The analysis didn\'t return results. The website may block automated testing.';
+  }
+  return null;
+}
+
+// Tries Google's PageSpeed Insights API first (fast when Google isn't under load), and falls
+// back to running our own headless Chrome + Lighthouse if that fails or times out. The two
+// strategies are separate requests from the client (see route.ts/use-analysis.ts) rather than
+// one long request internally, so the client can show "Google is slow, trying another way"
+// truthfully at the moment the fallback actually starts, and so each attempt gets its own full
+// timeout budget instead of splitting one budget across both.
+export async function analyzeURL(url: string, strategy: 'psi' | 'self-hosted' = 'psi'): Promise<APIResponse> {
+  const validation = normalizeAndValidateUrl(url);
+  if (!validation.success) {
+    return { success: false, error: validation.error };
+  }
+  const normalizedUrl = validation.normalizedUrl;
+
+  const reachability = await checkReachable(normalizedUrl);
+  if (!reachability.reachable) {
+    return { success: false, error: reachability.error };
+  }
+
+  if (strategy === 'psi') {
+    try {
+      // Kept comfortably under the route's 60s maxDuration so a slow Google response still
+      // leaves the client time to see this fail and kick off the fallback request.
+      const PSI_TIMEOUT_MS = 25000;
+      const [lighthouse, fieldData] = await Promise.all([
+        runPageSpeedInsights(normalizedUrl, PSI_TIMEOUT_MS),
+        fetchCruxFieldData(normalizedUrl),
+      ]);
+
+      const validationError = validateLighthouseResult(lighthouse);
+      if (validationError) {
+        return { success: false, error: validationError, errorCode: 'PSI_UNAVAILABLE' };
+      }
+
+      return { success: true, report: buildReportFromLighthouse(lighthouse, fieldData, normalizedUrl) };
+    } catch {
+      // Any failure here (timeout, rate limit, transient 5xx, etc.) just means "Google wasn't
+      // available this time" — the fallback runs its own independent analysis regardless of why.
+      return { success: false, error: 'Google\'s PageSpeed servers didn\'t respond in time.', errorCode: 'PSI_UNAVAILABLE' };
+    }
+  }
+
+  // strategy === 'self-hosted'
+  try {
+    // Left with headroom under the route's 60s maxDuration for the reachability check above
+    // and building the response, so our own graceful timeout message fires instead of the
+    // platform hard-killing the function first. This bounds the whole Lighthouse run (Chrome
+    // launch + page load + audit computation), not just the page-load phase.
+    const LIGHTHOUSE_TIMEOUT_MS = 45000;
+    const [lighthouse, fieldData] = await Promise.all([
+      runSelfHostedLighthouse(normalizedUrl, LIGHTHOUSE_TIMEOUT_MS),
+      fetchCruxFieldData(normalizedUrl),
+    ]);
+
+    const validationError = validateLighthouseResult(lighthouse);
+    if (validationError) {
+      return { success: false, error: validationError };
+    }
+
+    return { success: true, report: buildReportFromLighthouse(lighthouse, fieldData, normalizedUrl) };
   } catch (err: any) {
     if (err.name === 'AbortError' || err.name === 'TimeoutError') {
       return { success: false, error: 'The analysis timed out. The website may be very slow or unreachable. Try again.' };
     }
-    console.error('PageSpeed API error:', err);
+    console.error('Lighthouse analysis error:', err);
     return { success: false, error: 'Something went wrong analyzing this URL. Please try again.' };
   }
 }
@@ -629,18 +814,17 @@ function extractFileName(url: string): string {
 
 // How much work a fix typically takes, independent of how much it matters.
 const EFFORT_BY_KEY: Record<string, 'easy' | 'medium' | 'hard'> = {
-  'uses-optimized-images': 'easy',
-  'serve-images-webp': 'easy',
-  'efficient-images': 'easy',
-  'next-gen-formats': 'easy',
-  'offscreen-images': 'easy',
-  'uses-responsive-images': 'easy',
+  'image-delivery-insight': 'easy',
   'unminified-css': 'easy',
   'unminified-javascript': 'easy',
-  'uses-legacy-javascript': 'easy',
+  'legacy-javascript-insight': 'easy',
+  'cache-insight': 'easy',
+  'lcp-discovery-insight': 'easy',
   'unused-css-rules': 'medium',
   'unused-javascript': 'medium',
-  'render-blocking-resources': 'medium',
+  'render-blocking-insight': 'medium',
+  'third-parties-insight': 'medium',
+  'network-dependency-tree-insight': 'medium',
   'cumulative-layout-shift': 'medium',
   'first-contentful-paint': 'medium',
   'speed-index': 'medium',
@@ -678,7 +862,210 @@ function getIgnoreReason(problem: { verdict: string; savingsLabel?: string }): s
     : 'This has minimal effect on your visitors right now.';
 }
 
-function buildProblems(audits: Array<{ key: string; title: string; description: string; score: number | null; scoreDisplayMode: string; wastedBytes: number; wastedMs: number; numericValue: number | null; numericUnit: string | null; displayValue: string | null; items: Array<{ url?: string; name?: string; size?: number; wastedBytes?: number; wastedMS?: number; }>; }>, framework: string | null, verbosity: 'simple' | 'developer', performanceScore: number) {
+// network-dependency-tree-insight is marked "informative" by Lighthouse (so it never reaches the
+// normal parseAudits/createProblemByKey pipeline) and its useful data sits inside a "list-section"
+// item rather than the top-level "chains"/"longestChain" fields the old critical-request-chains
+// audit used. It's read directly from the raw audits and walked defensively; any unexpected shape
+// just results in no problem, never a crash.
+function buildWaterfallProblem(
+  rawAudits: Record<string, RawAudit>,
+  framework: string | null,
+  performanceScore: number
+) {
+  try {
+    const audit = rawAudits['network-dependency-tree-insight'];
+    if (!audit) return null;
+
+    const items = audit.details?.items;
+    if (!Array.isArray(items)) return null;
+
+    const treeItem = (items as unknown as Array<{ value?: { type?: string; chains?: Record<string, unknown>; longestChain?: { duration?: number } } }>)
+      .find((i) => i?.value?.type === 'network-tree');
+    if (!treeItem?.value) return null;
+
+    const chains = treeItem.value.chains;
+    const durationMs = typeof treeItem.value.longestChain?.duration === 'number' ? treeItem.value.longestChain.duration : 0;
+
+    type ChainNode = { children?: Record<string, unknown> };
+    const depthOf = (node: unknown, depth: number): number => {
+      const n = node as ChainNode;
+      const children = n?.children;
+      if (!children || typeof children !== 'object' || Object.keys(children).length === 0) return depth;
+      let max = depth;
+      for (const key of Object.keys(children)) {
+        max = Math.max(max, depthOf(children[key], depth + 1));
+      }
+      return max;
+    };
+
+    let length = 0;
+    if (chains && typeof chains === 'object') {
+      for (const key of Object.keys(chains)) {
+        length = Math.max(length, depthOf((chains as Record<string, unknown>)[key], 1));
+      }
+    }
+
+    if (!length || length < 3) return null; // shallow chains aren't worth flagging
+
+    const seconds = durationMs / 1000;
+    const scoresWell = performanceScore >= 90;
+
+    return {
+      title: scoresWell ? 'Some requests could start a bit sooner' : 'Your page waits for one request before starting the next',
+      impact: (length >= 5 || seconds > 1.5 ? 'high' : 'low') as 'high' | 'low',
+      description: `We found a chain of ${length} requests that load one after another instead of in parallel${seconds > 0.05 ? `, taking about ${seconds.toFixed(1)}s` : ''}.`,
+      soWhat: 'Each request waits for the previous one to finish, so the page is slower than the sum of its parts would suggest.',
+      whatToDo: [
+        'Fetch independent data in parallel instead of one request after another',
+        'Move data fetching earlier (server-side) instead of waiting for the page to mount first',
+        'Preload critical requests you already know you\'ll need',
+      ],
+      devWhatToDo: [
+        'Check the Network tab waterfall for requests that only start after a previous one finishes',
+        'If using useEffect + fetch, combine independent requests with Promise.all instead of sequential awaits',
+        'Consider fetching in a Server Component or route loader instead of client-side after mount',
+        'Add <link rel="preload"> or <link rel="preconnect"> for requests you can predict early',
+      ].filter(Boolean),
+      savingsBytes: undefined,
+      savingsLabel: undefined,
+      details: `Lighthouse audit: network-dependency-tree-insight. Longest chain: ${length} requests.`,
+      auditKey: 'network-dependency-tree-insight',
+      simpleExplanation: 'Your page waits for one request before starting the next. These could load together.',
+      developerExplanation: `Longest critical request chain is ${length} requests deep${seconds > 0.05 ? ` (about ${seconds.toFixed(1)}s)` : ''}. Parallelize independent fetches or move them earlier in the render.`,
+      frameworkTip: framework === 'Next.js' ? 'Fetch in a Server Component instead of a client useEffect where possible.' : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// lcp-discovery-insight is a checklist audit (details.type "list"), not the table/items shape
+// the normal pipeline expects, so it's read directly from the raw audits.
+function buildLcpDiscoveryProblem(
+  rawAudits: Record<string, RawAudit>,
+  framework: string | null,
+  performanceScore: number
+) {
+  try {
+    const audit = rawAudits['lcp-discovery-insight'];
+    if (!audit) return null;
+
+    const items = audit.details?.items;
+    if (!Array.isArray(items)) return null;
+
+    const checklistItem = (items as unknown as Array<{ type?: string; items?: Record<string, { label?: string; value?: boolean }> }>)
+      .find((i) => i?.type === 'checklist');
+    const checklist = checklistItem?.items;
+    if (!checklist) return null;
+
+    const lazyLoaded = checklist.eagerlyLoaded?.value === false;
+    const notDiscoverable = checklist.requestDiscoverable?.value === false;
+    const noPriorityHint = checklist.priorityHinted?.value === false;
+
+    if (!lazyLoaded && !notDiscoverable && !noPriorityHint) return null; // all checks pass, nothing to report
+
+    const scoresWell = performanceScore >= 90;
+    const highImpact = lazyLoaded || notDiscoverable;
+
+    const issues: string[] = [];
+    if (lazyLoaded) issues.push('it\'s marked loading="lazy"');
+    if (notDiscoverable) issues.push('it isn\'t discoverable directly in the HTML');
+    if (noPriorityHint) issues.push('it\'s missing a fetchpriority="high" hint');
+
+    return {
+      title: scoresWell ? 'Your main image could be discovered a bit sooner' : 'Your most important image loads later than it should',
+      impact: (highImpact ? 'high' : 'low') as 'high' | 'low',
+      description: `The largest visible element on the page is slower to load because ${issues.join(' and ')}.`,
+      soWhat: 'The browser can\'t start downloading the main image as early as it could, which delays when visitors see it.',
+      whatToDo: [
+        lazyLoaded ? 'Remove loading="lazy" from your largest above-the-fold image' : '',
+        notDiscoverable ? 'Make sure the image URL is present directly in the HTML, not injected by JavaScript' : '',
+        noPriorityHint ? 'Add fetchpriority="high" so the browser prioritizes it' : '',
+        framework === 'Next.js' ? 'Use Next.js <Image priority> for the LCP image, it handles all of this automatically' : '',
+      ].filter(Boolean),
+      devWhatToDo: [
+        'Find the LCP element in DevTools Performance panel (Timings > LCP)',
+        lazyLoaded ? 'Confirm it does not have loading="lazy", only below-the-fold images should be lazy' : '',
+        notDiscoverable ? 'Ensure the <img src> or <picture> markup is in the initial server-rendered HTML, not added after hydration' : '',
+        noPriorityHint ? 'Add fetchpriority="high" and consider <link rel="preload" as="image"> for the same resource' : '',
+        framework === 'Next.js' ? '<Image priority /> disables lazy-loading and adds a preload hint automatically' : '',
+      ].filter(Boolean),
+      savingsBytes: undefined,
+      savingsLabel: undefined,
+      details: `Lighthouse audit: lcp-discovery-insight.`,
+      auditKey: 'lcp-discovery-insight',
+      simpleExplanation: 'Your most important image could be found and loaded sooner.',
+      developerExplanation: `LCP discovery checklist failed: ${issues.join(', ')}. Fix the HTML/attributes so the browser can prioritize this resource immediately.`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// third-parties-insight is scoreDisplayMode "informative" so it's filtered out of the normal
+// parseAudits pipeline; read directly from the raw audits instead. Its score is always 1 and
+// doesn't indicate severity, so impact is judged from aggregate main-thread time and bytes.
+function buildThirdPartiesProblem(
+  rawAudits: Record<string, RawAudit>,
+  framework: string | null,
+  performanceScore: number
+) {
+  try {
+    const audit = rawAudits['third-parties-insight'];
+    if (!audit) return null;
+
+    const items = audit.details?.items;
+    if (!Array.isArray(items) || items.length === 0) return null;
+
+    let totalMainThreadMs = 0;
+    let totalTransferBytes = 0;
+    let biggest: { entity?: string; mainThreadTime?: number } | null = null;
+
+    for (const raw of items as unknown as Array<{ entity?: string; mainThreadTime?: number; transferSize?: number }>) {
+      const mtt = typeof raw.mainThreadTime === 'number' ? raw.mainThreadTime : 0;
+      const ts = typeof raw.transferSize === 'number' ? raw.transferSize : 0;
+      totalMainThreadMs += mtt;
+      totalTransferBytes += ts;
+      if (!biggest || mtt > (biggest.mainThreadTime || 0)) biggest = raw;
+    }
+
+    if (totalMainThreadMs < 150) return null; // negligible main-thread cost, not worth flagging
+
+    const biggestName = typeof biggest?.entity === 'string' ? biggest.entity : null;
+    const scoresWell = performanceScore >= 90;
+
+    return {
+      title: scoresWell ? 'Third-party scripts add a little overhead' : 'Third-party scripts are slowing down your page',
+      impact: (totalMainThreadMs > 500 ? 'high' : totalMainThreadMs > 150 ? 'medium' : 'low') as 'high' | 'medium' | 'low',
+      description: biggestName
+        ? `${biggestName} is the biggest third-party contributor, using about ${totalMainThreadMs.toFixed(0)}ms of main-thread time across ${items.length} services.`
+        : `Third-party scripts use about ${totalMainThreadMs.toFixed(0)}ms of main-thread time across ${items.length} services.`,
+      soWhat: 'Analytics, ad, and tracking scripts compete with your own code for the same network and CPU time.',
+      whatToDo: [
+        biggestName ? `Check whether ${biggestName} is actually needed on this page` : 'Audit which third-party scripts are actually needed on this page',
+        'Load non-critical third-party scripts after the page becomes interactive',
+        'Remove tracking or ad scripts that duplicate each other',
+      ],
+      devWhatToDo: [
+        'Open DevTools Performance panel and group by "3rd party" to see exact cost per script',
+        'Defer non-critical third-party scripts (Next.js: <Script strategy="lazyOnload" or "worker">)',
+        'Check for duplicate tracking pixels/tags doing the same job, common after stacking multiple marketing tools',
+      ],
+      savingsBytes: totalTransferBytes > 0 ? totalTransferBytes : undefined,
+      savingsLabel: totalTransferBytes > 0 ? bytesToLabel(totalTransferBytes) : undefined,
+      details: `Lighthouse audit: third-parties-insight.`,
+      auditKey: 'third-parties-insight',
+      simpleExplanation: 'External scripts are adding extra load time before visitors can use the page.',
+      developerExplanation: biggestName
+        ? `${biggestName} accounts for the largest share of third-party main-thread time (~${totalMainThreadMs.toFixed(0)}ms total across all third parties). Defer or remove non-essential scripts.`
+        : `Third-party scripts use ~${totalMainThreadMs.toFixed(0)}ms of main-thread time total. Defer or remove non-essential scripts.`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildProblems(audits: Array<{ key: string; title: string; description: string; score: number | null; scoreDisplayMode: string; wastedBytes: number; wastedMs: number; numericValue: number | null; numericUnit: string | null; displayValue: string | null; items: Array<{ url?: string; name?: string; size?: number; wastedBytes?: number; wastedMS?: number; }>; }>, framework: string | null, verbosity: 'simple' | 'developer', performanceScore: number, rawAudits: Record<string, RawAudit>) {
   const problems: Array<{
     title: string;
     resource?: string;
@@ -712,6 +1099,10 @@ function buildProblems(audits: Array<{ key: string; title: string; description: 
     const result = createProblemByKey(audit, framework, verbosity, performanceScore);
     addProblem(result);
   }
+
+  addProblem(buildWaterfallProblem(rawAudits, framework, performanceScore));
+  addProblem(buildLcpDiscoveryProblem(rawAudits, framework, performanceScore));
+  addProblem(buildThirdPartiesProblem(rawAudits, framework, performanceScore));
 
   // Sort: fix-now first, then fix-next, then by impact within each group
   const VERDICT_RANK: Record<string, number> = { 'fix-now': 0, 'fix-next': 1, 'leave-it': 2, 'optional': 3, 'ignore': 4 };
@@ -821,7 +1212,7 @@ function createProblemByKey(audit: { key: string; title: string; description: st
   if (wastedBytes <= 0 && wastedMs <= 0 && !numericValue) return null;
 
   // --- Images ---
-  if (['uses-optimized-images', 'serve-images-webp', 'efficient-images', 'next-gen-formats'].includes(key)) {
+  if (key === 'image-delivery-insight') {
     const biggest = items.reduce((a, b) => (a.size || 0) > (b.size || 0) ? a : b);
     const savings = items.reduce((sum, i) => sum + (i.wastedBytes || 0), 0) + wastedBytes;
 
@@ -954,20 +1345,22 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     };
   }
 
-  if (key === 'render-blocking-resources') {
-    const cssItems = items.filter(i => i.name?.toLowerCase().includes('css') || i.url?.toLowerCase().endsWith('.css'));
-    const savings = cssItems.reduce((s, i) => s + (i.size || 0), 0) + wastedBytes;
+  if (key === 'render-blocking-insight') {
+    const blockingMs = wastedMs;
+    const totalBlockingBytes = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = fileNameOf(biggest?.url);
 
     return {
       title: 'Render-blocking resources are delaying the first paint',
-      resource: cssItems[0]?.url,
-      impact: savings > 50_000 ? 'high' : savings > 10_000 ? 'medium' : 'low',
-      description: `${cssItems.length} CSS file(s) are blocking the page from rendering. The browser waits for these to load before showing anything.`,
+      resource: biggest?.url,
+      impact: blockingMs > 750 ? 'high' : blockingMs > 250 ? 'medium' : 'low',
+      description: `${items.length} resource(s), ${bytesToLabel(totalBlockingBytes)} total, are blocking the page from rendering for about ${blockingMs.toFixed(0)}ms. The browser waits for these before showing anything.`,
       soWhat: 'Visitors see a blank screen until these files finish downloading.',
       whatToDo: [
         'Inline critical CSS',
         'Defer non-critical CSS with media queries or rel="preload"',
-        'Reduce the size of render-blocking CSS',
+        'Reduce the size of render-blocking CSS and JS',
       ],
       devWhatToDo: [
         'Extract above-the-fold CSS with `critical` or `criticters` and inline it in <head>',
@@ -975,71 +1368,14 @@ function createProblemByKey(audit: { key: string; title: string; description: st
         'Move blocking <script> tags to the end of <body> or add defer',
         framework === 'Next.js' ? 'Use next/script with strategy="afterInteractive" for non-critical scripts' : 'Add defer or async to non-critical <script> tags',
       ],
-      savingsBytes: savings,
-      savingsLabel: bytesToLabel(savings),
-      details: `Lighthouse audit: ${title}. Found ${cssItems.length} render-blocking CSS resource(s).`,
+      savingsBytes: totalBlockingBytes,
+      savingsLabel: bytesToLabel(totalBlockingBytes),
+      details: `Lighthouse audit: ${title}. Found ${items.length} render-blocking resource(s), longest ${blockingMs.toFixed(0)}ms.`,
       auditKey: key,
-      simpleExplanation: 'Some stylesheets are stopping the page from showing up quickly.',
-      developerExplanation: `${cssItems.length} render-blocking CSS file(s) delay FCP. Inline critical CSS and defer the rest.`,
-    };
-  }
-
-  if (key === 'uses-responsive-images') {
-    return {
-      title: 'Images are not optimized for different screen sizes',
-      impact: 'medium',
-      description: 'Some images may be larger than necessary for the device loading the page.',
-      soWhat: 'Mobile users download desktop-sized images they don\'t need.',
-      whatToDo: [
-        'Use srcset and sizes attributes',
-        'Serve appropriately sized images per breakpoint',
-        'Use <picture> for art direction',
-        framework === 'Next.js' ? 'Use Next.js <Image> with responsive sizes' : '',
-      ].filter(Boolean),
-      devWhatToDo: [
-        'Generate 2-3 width variants per image (e.g. 640/1280/1920px) and serve via srcset',
-        'Set an accurate sizes attribute matching your actual CSS layout, not just viewport width',
-        framework === 'Next.js' ? 'next/image handles this automatically once sizes is set correctly' : 'Consider an image CDN that resizes on the fly via URL params',
-      ].filter(Boolean),
-      savingsBytes: wastedBytes,
-      savingsLabel: bytesToLabel(wastedBytes),
-      details: `Lighthouse audit: ${title}.`,
-      auditKey: key,
-      simpleExplanation: 'Some images are bigger than they need to be for mobile visitors.',
-      developerExplanation: 'Serve responsive images using srcset/sizes to avoid over-downloading on smaller screens.',
-    };
-  }
-
-  if (key === 'offscreen-images') {
-    const savings = wastedBytes;
-    const biggest = biggestWaster(items);
-    const biggestName = fileNameOf(biggest?.url);
-    return {
-      title: 'Images below the fold are loaded immediately',
-      resource: biggest?.url,
-      impact: savings > 500_000 ? 'high' : savings > 100_000 ? 'medium' : 'low',
-      description: biggestName
-        ? `${biggestName} (${bytesToLabel(biggest?.size || biggest?.wastedBytes || savings)}) loads before it's visible, along with ${bytesToLabel(savings)} of offscreen images in total.`
-        : `About ${bytesToLabel(savings)} of images could be lazy-loaded since they aren't visible when the page first opens.`,
-      soWhat: 'The browser downloads images the visitor can\'t even see yet.',
-      whatToDo: [
-        biggestName ? `Add loading="lazy" to ${biggestName} and other below-the-fold images` : 'Add loading="lazy" to below-the-fold images',
-        'Use Intersection Observer for custom lazy-loading',
-        'Consider responsive loading strategies',
-      ],
-      devWhatToDo: [
-        'Add native loading="lazy" (supported everywhere now, no library needed)',
-        'For carousels/galleries, only mount images within a few slides of the visible one',
-        'Verify your actual LCP image is NOT lazy-loaded, it should have fetchpriority="high" instead',
-      ],
-      savingsBytes: savings,
-      savingsLabel: bytesToLabel(savings),
-      details: `Lighthouse audit: ${title}.`,
-      auditKey: key,
-      simpleExplanation: 'The page loads images that are off-screen, wasting bandwidth.',
+      simpleExplanation: 'Some files are stopping the page from showing up quickly.',
       developerExplanation: biggestName
-        ? `${biggestName} is eagerly loaded despite being offscreen. Add loading="lazy" (${bytesToLabel(savings)} of offscreen images total).`
-        : `${bytesToLabel(savings)} of offscreen images eagerly loaded. Add loading="lazy" to defer them.`,
+        ? `${biggestName} is the largest render-blocking resource. ${items.length} render-blocking resource(s) delay FCP by up to ${blockingMs.toFixed(0)}ms. Inline critical CSS and defer the rest.`
+        : `${items.length} render-blocking resource(s) delay FCP by up to ${blockingMs.toFixed(0)}ms. Inline critical CSS and defer the rest.`,
     };
   }
 
@@ -1108,15 +1444,50 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     };
   }
 
+  if (key === 'cache-insight') {
+    const savings = wastedBytes;
+    const biggest = biggestWaster(items);
+    const biggestName = biggest?.name || fileNameOf(biggest?.url);
+    return {
+      title: 'Visitors re-download files they already have',
+      resource: biggest?.url,
+      impact: savings > 200_000 ? 'medium' : 'low',
+      description: biggestName
+        ? `${biggestName} isn't cached efficiently, so returning visitors download it again.`
+        : 'Static files aren\'t cached efficiently, so returning visitors re-download data they already have.',
+      soWhat: 'Repeat visitors wait for files that didn\'t need to change since their last visit.',
+      whatToDo: [
+        'Set long max-age cache headers on static assets (JS, CSS, images, fonts)',
+        'Use content-hashed filenames so long caching is safe',
+        'Check your CDN\'s default cache-control settings',
+      ],
+      devWhatToDo: [
+        'Set Cache-Control: public, max-age=31536000, immutable on hashed static assets',
+        'Next.js: files under /_next/static are already immutable, check custom routes and /public assets',
+        'Verify your CDN/edge isn\'t overriding origin cache-control with a shorter TTL',
+      ],
+      savingsBytes: savings,
+      savingsLabel: bytesToLabel(savings),
+      details: `Lighthouse audit: ${title}.`,
+      auditKey: key,
+      simpleExplanation: 'Visitors are waiting for data that could have been reused.',
+      developerExplanation: biggestName
+        ? `${biggestName} has a short or missing cache lifetime. Set a long max-age with a content hash in the filename.`
+        : `${bytesToLabel(savings)} could be saved with better cache headers on static assets.`,
+    };
+  }
+
   if (key === 'largest-contentful-paint') {
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
-    const seconds = typeof value === 'number' && value < 10 ? value : value / 1000;
+    // numericValue for a timing audit is always in milliseconds (Lighthouse's own convention,
+    // numericUnit is always "millisecond"), never pre-converted to seconds. No guessing needed.
+    const seconds = value / 1000;
     if (seconds <= 1.8) return null; // already good, nothing to report
     return {
       title: scoresWell ? 'Main content could appear a bit sooner' : 'Your main content appears too late',
       impact: seconds > 3.0 ? 'high' : 'low',
-      description: `The largest visible element appears at ${typeof seconds === 'number' && seconds < 10 ? seconds.toFixed(1) + 's' : (seconds).toFixed(1) + 's'}. Visitors wait too long for the main content.`,
+      description: `The largest visible element appears at ${seconds.toFixed(1)}s. Visitors wait too long for the main content.`,
       soWhat: 'Users perceive the page as slow when the main content takes too long to show.',
       whatToDo: [
         'Optimize the LCP element (often an image or text block)',
@@ -1144,7 +1515,7 @@ function createProblemByKey(audit: { key: string; title: string; description: st
   if (key === 'server-response-time') {
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
-    const seconds = typeof value === 'number' && value < 100 ? value : value / 1000;
+    const seconds = value / 1000;
     if (seconds <= 0.8) return null; // already good, nothing to report
     return {
       title: scoresWell ? 'Server response could be a bit faster' : 'The server takes too long to respond',
@@ -1293,7 +1664,7 @@ function createProblemByKey(audit: { key: string; title: string; description: st
   if (key === 'speed-index') {
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
-    const seconds = typeof value === 'number' && value < 100 ? value : value / 1000;
+    const seconds = value / 1000;
     if (seconds <= 1.2) return null; // already good, nothing to report
     return {
       title: scoresWell ? 'The page could visually fill in a bit faster' : 'The page takes too long to visually populate',
@@ -1323,7 +1694,7 @@ function createProblemByKey(audit: { key: string; title: string; description: st
   if (key === 'first-contentful-paint') {
     const value = numericValue || wastedMs || 0;
     if (!value) return null;
-    const seconds = typeof value === 'number' && value < 100 ? value : value / 1000;
+    const seconds = value / 1000;
     if (seconds <= 0.8) return null; // already good, nothing to report
     return {
       title: scoresWell ? 'First content could appear a bit sooner' : 'The first content appears slowly',
@@ -1338,7 +1709,7 @@ function createProblemByKey(audit: { key: string; title: string; description: st
       ],
       devWhatToDo: [
         'Check TTFB first, FCP can never beat server response time',
-        'Inline critical CSS (see render-blocking-resources fix) to unblock first paint',
+        'Inline critical CSS (see the render-blocking resources fix) to unblock first paint',
         'Preload the font and hero asset with <link rel="preload">',
       ],
       savingsBytes: undefined,
@@ -1350,7 +1721,7 @@ function createProblemByKey(audit: { key: string; title: string; description: st
     };
   }
 
-  if (key === 'uses-legacy-javascript') {
+  if (key === 'legacy-javascript-insight') {
     const savings = wastedBytes;
     const biggest = biggestWaster(items);
     const biggestName = fileNameOf(biggest?.url);
