@@ -20,10 +20,17 @@ async function launchBrowser(): Promise<Browser> {
       import('@sparticuz/chromium'),
       import('puppeteer-core'),
     ]);
+    // @sparticuz/chromium only ships chrome-headless-shell (chromium.args already bakes in
+    // --headless='shell'), not full Chrome. headless: true tells Puppeteer to launch full
+    // Chrome's newer headless mode instead, which the packaged binary doesn't support, and the
+    // two headless flags fight each other, this hung on launch in production rather than
+    // erroring, silently eating the whole timeout budget. headless: "shell" plus
+    // puppeteer.defaultArgs() (rather than chromium.args directly) is the combination
+    // @sparticuz/chromium's own docs use and test against.
     return puppeteerCore.launch({
-      args: chromium.args,
+      args: await puppeteerCore.defaultArgs({ args: chromium.args, headless: 'shell' }),
       executablePath: await chromium.executablePath(),
-      headless: true,
+      headless: 'shell',
     }) as unknown as Browser;
   }
 
