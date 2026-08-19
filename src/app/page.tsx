@@ -14,14 +14,12 @@ import {
   ResourceList,
   FrameworkBadge,
 } from '@/lib/problem-utils';
-import { toast } from '@/components/ui/toast';
 import {
   Loader2,
   ExternalLink,
   ArrowLeft,
   ArrowRight,
   Check,
-  Share2,
   Plus,
   Lightbulb,
   ShieldCheck,
@@ -70,6 +68,7 @@ export default function Home() {
     setVerbosity,
     submitURL,
     reset,
+    usingFallback,
   } = useAnalysis();
 
   const [stageIndex, setStageIndex] = useState(0);
@@ -96,16 +95,6 @@ export default function Home() {
     const url = domain ? `https://${domain}` : 'https://example.com';
     setInputURL(url);
     submitURL(url);
-  };
-
-  const handleShare = () => {
-    if (typeof window !== 'undefined') {
-      navigator.clipboard.writeText(window.location.href).then(() => {
-        toast.add({ title: 'Link copied', description: 'Report link copied to clipboard.' });
-      }).catch(() => {
-        toast.add({ title: 'Could not copy link' });
-      });
-    }
   };
 
   return (
@@ -143,8 +132,8 @@ export default function Home() {
           <div className="flex-1 flex flex-col">
             <div className="flex-1 flex flex-col items-center justify-center px-6 py-20">
               <div className="max-w-2xl w-full text-center">
-                <div className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground bg-muted px-3 py-1.5 rounded-full mb-6">
-                  <ShieldCheck className="w-3.5 h-3.5" />
+                <div className="inline-flex items-center gap-1.5 text-sm font-medium text-muted-foreground bg-muted px-3 py-1.5 rounded-full mb-6">
+                  <ShieldCheck className="w-4 h-4" />
                   <span>Free</span>
                   <span className="text-border">·</span>
                   <span>No signup</span>
@@ -152,7 +141,7 @@ export default function Home() {
                   <span>Takes about a minute</span>
                 </div>
 
-                <h1 className="text-4xl sm:text-5xl font-bold tracking-tight text-foreground leading-[1.1]">
+                <h1 className="text-5xl sm:text-6xl font-bold tracking-tight text-foreground leading-[1.1]">
                   Why is my{' '}
                   <span className="relative inline-block whitespace-nowrap">
                     <span className="relative z-10">website</span>
@@ -160,7 +149,7 @@ export default function Home() {
                   </span>{' '}
                   slow?
                 </h1>
-                <p className="mt-4 text-lg text-muted-foreground">
+                <p className="mt-4 text-xl text-muted-foreground">
                   Paste a URL. We&apos;ll tell you what&apos;s actually worth fixing, and what you can safely ignore.
                 </p>
 
@@ -177,13 +166,13 @@ export default function Home() {
                         }
                       }}
                       placeholder="https://yourwebsite.com"
-                      className="w-full h-14 px-4 text-base rounded-xl border border-border bg-white text-foreground placeholder:text-muted-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/40 transition-all"
+                      className="w-full h-14 px-4 text-lg rounded-xl border border-border bg-white text-foreground placeholder:text-muted-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/40 transition-all"
                     />
                   </div>
                   <button
                     onClick={() => handleAnalyze(inputURL)}
                     disabled={!inputURL.trim()}
-                    className="h-14 px-6 rounded-xl bg-primary text-primary-foreground font-semibold text-base disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90 transition-all flex items-center justify-center gap-2 min-w-[150px]"
+                    className="h-14 px-6 rounded-xl bg-primary text-primary-foreground font-semibold text-lg disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90 transition-all flex items-center justify-center gap-2 min-w-[150px]"
                   >
                     Analyze site
                     <ArrowRight className="w-4 h-4" />
@@ -192,13 +181,13 @@ export default function Home() {
 
                 {/* Try example */}
                 <div className="mt-6">
-                  <p className="text-sm text-muted-foreground mb-3">Don&apos;t have a URL? Try an example</p>
+                  <p className="text-base text-muted-foreground mb-3">Don&apos;t have a URL? Try an example</p>
                   <div className="flex flex-col sm:flex-row items-center justify-center gap-2">
                     {EXAMPLES.map((domain) => (
                       <button
                         key={domain}
                         onClick={() => handleTryExample(domain)}
-                        className="w-full sm:w-auto flex items-center justify-between sm:justify-center gap-2 px-4 py-2 rounded-lg border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors"
+                        className="w-full sm:w-auto flex items-center justify-between sm:justify-center gap-2 px-4 py-2 rounded-lg border border-border text-base font-medium text-foreground hover:bg-muted transition-colors"
                       >
                         https://{domain}
                         <ArrowRight className="w-3.5 h-3.5 text-muted-foreground" />
@@ -207,7 +196,7 @@ export default function Home() {
                   </div>
                 </div>
 
-                <p className="mt-8 text-xs text-muted-foreground">
+                <p className="mt-8 text-sm text-muted-foreground">
                   We analyze the public URL you provide. No account or project data is stored.
                 </p>
               </div>
@@ -216,9 +205,9 @@ export default function Home() {
             {/* How it works */}
             <div id="how-it-works" className="border-t border-border bg-muted/40 px-6 py-16 scroll-mt-16">
               <div className="max-w-4xl mx-auto">
-                <h2 className="text-2xl font-bold text-foreground text-center mb-1">How LoadCheck works</h2>
-                <p className="text-sm text-muted-foreground text-center mb-10">
-                  We analyze using Google PageSpeed Insights and Lighthouse under the hood, then turn the results into simple, actionable advice.
+                <h2 className="text-3xl font-bold text-foreground text-center mb-1">How LoadCheck works</h2>
+                <p className="text-base text-muted-foreground text-center mb-10">
+                  We analyze using Lighthouse under the hood, then turn the results into simple, actionable advice.
                 </p>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-8">
                   {HOW_IT_WORKS.map((step, i) => (
@@ -227,10 +216,10 @@ export default function Home() {
                         <step.icon className="w-5 h-5 text-foreground" />
                       </div>
                       <div>
-                        <div className="text-sm font-semibold text-foreground">
+                        <div className="text-base font-semibold text-foreground">
                           {i + 1}. {step.title}
                         </div>
-                        <p className="mt-1 text-xs text-muted-foreground">{step.description}</p>
+                        <p className="mt-1 text-sm text-muted-foreground">{step.description}</p>
                       </div>
                     </div>
                   ))}
@@ -246,6 +235,15 @@ export default function Home() {
             <div className="max-w-md w-full">
               <h2 className="text-2xl font-bold text-foreground text-center">Analyzing your site</h2>
               <p className="mt-1 text-sm text-muted-foreground text-center">This usually takes 30&ndash;60 seconds</p>
+
+              {usingFallback && (
+                <div className="mt-4 flex items-start gap-3 bg-amber-50 border border-amber-300 rounded-xl p-4">
+                  <Loader2 className="w-4 h-4 shrink-0 mt-0.5 text-amber-700 animate-spin" />
+                  <p className="text-sm text-amber-900">
+                    Google servers are slow, trying other ways&hellip;
+                  </p>
+                </div>
+              )}
 
               <div className="mt-10">
                 {STAGES.map((stage, i) => {
@@ -328,22 +326,13 @@ export default function Home() {
                   <ArrowLeft className="w-4 h-4" />
                   Analyze another URL
                 </button>
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    onClick={handleShare}
-                    className="h-8 px-3 rounded-lg border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors inline-flex items-center gap-1.5"
-                  >
-                    <Share2 className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline">Share report</span>
-                  </button>
-                  <button
-                    onClick={reset}
-                    className="h-8 px-3 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors inline-flex items-center gap-1.5"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    New analysis
-                  </button>
-                </div>
+                <button
+                  onClick={reset}
+                  className="h-8 px-3 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors inline-flex items-center gap-1.5 shrink-0"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  New analysis
+                </button>
               </div>
 
               {/* URL */}
@@ -465,8 +454,10 @@ export default function Home() {
                       key={metric.label}
                       label={metric.label}
                       value={
+                        // metric.value is already converted to the right unit by getMetrics()
+                        // in ps-api.ts, no further guessing/conversion needed here.
                         metric.unit === 'seconds'
-                          ? metric.value < 10 ? `${metric.value.toFixed(1)}s` : `${(metric.value / 1000).toFixed(1)}s`
+                          ? `${metric.value.toFixed(1)}s`
                           : metric.unit === 'milliseconds'
                           ? `${metric.value.toFixed(0)}ms`
                           : metric.value.toFixed(2)

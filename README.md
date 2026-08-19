@@ -4,6 +4,8 @@ Google's PageSpeed Insights already measures your site. LoadCheck doesn't try to
 
 Paste a URL and LoadCheck turns a Lighthouse report into a short, plain-English list: what's worth fixing, what you can safely ignore, and how real visitors are experiencing your page compared to the lab test.
 
+LoadCheck runs Lighthouse itself, using its own headless Chrome instance, rather than calling Google's hosted PageSpeed Insights API. This removes the queue/rate-limit delays that API can have under load, which used to cause slow or timed-out analyses.
+
 ## What it does
 
 - **Leads with a verdict, not a score.** The headline is "3 things worth fixing," not "62/100." The score is still there if you want it, tucked into a collapsed "Technical details" section.
@@ -15,20 +17,6 @@ Paste a URL and LoadCheck turns a Lighthouse report into a short, plain-English 
 
 ## Setup
 
-### Get a Google PageSpeed Insights API key (optional but recommended)
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project (or select one)
-3. Enable the **PageSpeed Insights API**
-4. Create an API key (Credentials → API keys)
-5. Copy the key and add it to `.env.local`:
-
-```
-PAGESPEED_API_KEY=your_key_here
-```
-
-Without a key, the API works but has very low quota (sometimes 0/day for unverified projects). With a key, you get 25,000 queries/day free.
-
 ### Run locally
 
 ```bash
@@ -38,13 +26,41 @@ npm run dev
 
 Open http://localhost:3000
 
+The first `npm install` downloads a local copy of Chromium for `puppeteer` (used only in
+development). This is a one-time ~200-300MB download and needs a bit of free disk space.
+
+### Real-visitor comparison data (optional)
+
+The "how real visitors experienced this page" comparison uses Google's Chrome UX Report (CrUX)
+API, which is separate from PageSpeed Insights and needs its own API key setup:
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a project (or select one)
+3. Enable the **Chrome UX Report API**
+4. Create an API key (Credentials → API keys)
+5. Copy the key and add it to `.env.local`:
+
+```
+PAGESPEED_API_KEY=your_key_here
+```
+
+Without this, LoadCheck still fully works, the real-visitor comparison card just won't appear
+(most sites also don't have enough Chrome UX Report traffic for this data to exist anyway).
+
 ## Deploy to Vercel
 
 ```bash
 vercel
 ```
 
-Set `PAGESPEED_API_KEY` in Vercel's environment variables.
+Production needs `@sparticuz/chromium` + `puppeteer-core` to launch Chrome inside a serverless
+function (already a regular dependency, `puppeteer`'s own bundled Chromium is dev-only since it's
+too large to ship there). This is the standard, well-established pattern for running headless
+Chrome on Vercel/Lambda, but hasn't been verified against a live deployment yet, worth a real
+test analysis right after deploying. If it needs more memory than the function gets by default,
+that's configured via a `functions` block in `vercel.json`.
+
+Set `PAGESPEED_API_KEY` in Vercel's environment variables if you want real-visitor comparison data.
 
 ## Privacy
 

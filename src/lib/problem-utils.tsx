@@ -217,7 +217,7 @@ export function NotWorthFixingList({ items }: { items: Array<{ title: string; re
         Not worth your time right now
       </h3>
       <p className="text-sm text-muted-foreground mb-4">
-        PageSpeed flags these too, but fixing them won&apos;t meaningfully change what visitors experience.
+        Lighthouse flags these too, but fixing them won&apos;t meaningfully change what visitors experience.
       </p>
       <ul className="space-y-3">
         {items.map((item, i) => (
@@ -268,15 +268,14 @@ export function FieldDataCard({
 
 export function TechnicalDetails({ children }: { children: React.ReactNode }) {
   return (
-    <details className="group rounded-2xl border border-border bg-card">
-      <summary className="cursor-pointer list-none flex items-center justify-between p-5 text-sm font-medium text-foreground select-none">
-        <span>Technical details</span>
-        <ChevronRight className="w-4 h-4 text-muted-foreground transition-transform group-open:rotate-90" />
-      </summary>
+    <div className="rounded-2xl border border-border bg-card">
+      <div className="p-5 text-sm font-medium text-foreground">
+        Technical details
+      </div>
       <div className="px-5 pb-5 pt-1 border-t border-border space-y-6">
         {children}
       </div>
-    </details>
+    </div>
   );
 }
 
