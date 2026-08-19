@@ -2,12 +2,16 @@ import { analyzeURL } from '@/lib/ps-api';
 
 export { analyzeURL };
 
+// Running our own headless Chrome + Lighthouse (reachability check + browser launch + page
+// load + audits) can take a while, especially for heavier sites.
+export const maxDuration = 60;
+
 async function handler(request: Request) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
   }
 
-  let body: { url?: string };
+  let body: { url?: string; strategy?: string };
   try {
     body = await request.json();
   } catch {
@@ -25,7 +29,8 @@ async function handler(request: Request) {
     });
   }
 
-  const result = await analyzeURL(url);
+  const strategy = body.strategy === 'self-hosted' ? 'self-hosted' : 'psi';
+  const result = await analyzeURL(url, strategy);
   return new Response(JSON.stringify(result), {
     status: result.success ? 200 : 400,
     headers: { 'Content-Type': 'application/json' },
